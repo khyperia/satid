@@ -92,7 +92,7 @@ typedef struct
     FILE *tleFile;
     predict_observer_t *observer;
     double maxAngle;
-    double targetX, targetY, targetZ;
+    double targetRa, targetDec;
 } satid_state;
 
 satid_state *new_state(arguments args)
@@ -115,8 +115,8 @@ satid_state *new_state(arguments args)
     parsedTime.tm_mon -= 1;
     parsedTime.tm_year -= 1900;
     predict_julian_date_t jul = predict_to_julian(mktime(&parsedTime));
-    result.time_begin = jul + 5 / 1440.0;
-    result.time_end = jul - 10 / 1440.0;
+    result.time_begin = jul + 0.2 / 1440.0;
+    result.time_end = jul - 1.2 / 1440.0;
     result.tleFile = fopen(args.tleFile, "r");
     if (!result.tleFile)
     {
@@ -125,9 +125,8 @@ satid_state *new_state(arguments args)
     }
     result.observer = predict_create_observer(
             "Observer", args.latitude * DEG_TO_RAD, args.longitude * DEG_TO_RAD, args.altitude);
-    result.targetX = cos(args.declination * DEG_TO_RAD) * cos(args.rightAsc * DEG_TO_RAD);
-    result.targetY = cos(args.declination * DEG_TO_RAD) * sin(args.rightAsc * DEG_TO_RAD);
-    result.targetZ = sin(args.declination * DEG_TO_RAD);
+    result.targetRa = args.rightAsc * DEG_TO_RAD;
+    result.targetDec = args.declination * DEG_TO_RAD;
     result.maxAngle = args.maxAngle;
     satid_state *ptr = malloc(sizeof(satid_state));
     if (!ptr)
@@ -149,7 +148,39 @@ void delete_state(satid_state *state)
     }
 }
 
-double search_at(satid_state *state, predict_orbit_t *orbit, predict_julian_date_t time)
+void radec_to_altaz(predict_observer_t *observer, predict_orbit_t *satellite, struct predict_observation observation,
+                    double rightAsc, double declination, double *azimuth, double *elevation)
+{
+    const double range = 10000000;
+    predict_orbit_t scratch;
+    scratch.time = satellite->time;
+    scratch.position[0] = range * cos(declination) * cos(rightAsc) + (satellite->position[0] - observation.range_x);
+    scratch.position[1] = range * cos(declination) * sin(rightAsc) + (satellite->position[1] - observation.range_y);
+    scratch.position[2] = range * sin(declination) + (satellite->position[2] - observation.range_z);
+    scratch.velocity[0] = 0;
+    scratch.velocity[1] = 0;
+    scratch.velocity[2] = 0;
+    struct predict_observation result;
+    predict_observe_orbit(observer, &scratch, &result);
+    *azimuth = result.azimuth;
+    *elevation = result.elevation;
+}
+
+void satellite_altaz_with_refraction(predict_observer_t *observer, struct predict_observation observation,
+                                     double *azimuth, double *elevation)
+{
+    double refractionInfinite = predict_refraction(observation.elevation);
+    // http://docs.lib.noaa.gov/noaa_documents/NOS/NGS/professional%20paper/NOAA_PP_7.pdf
+    const double s = 0.001255;
+    double factor =
+            ((6371000 + observer->altitude) * s) / (1000 * observation.range * sin(observation.elevation));
+    factor *= 60;
+    double refractionSatellite = refractionInfinite * factor;
+    *elevation = observation.elevation - refractionSatellite;
+    *azimuth = observation.azimuth;
+}
+
+double search_at(satid_state *state, predict_orbit_t *orbit, predict_julian_date_t time, double *range, double *alt)
 {
     if (predict_orbit(orbit, time))
     {
@@ -158,13 +189,25 @@ double search_at(satid_state *state, predict_orbit_t *orbit, predict_julian_date
     }
     struct predict_observation observation;
     predict_observe_orbit(state->observer, orbit, &observation);
-    observation.range_x /= observation.range;
-    observation.range_y /= observation.range;
-    observation.range_z /= observation.range;
-    double cosAngle =
-            observation.range_x * state->targetX +
-            observation.range_y * state->targetY +
-            observation.range_z * state->targetZ;
+    if (range)
+    {
+        *range = observation.range;
+    }
+    if (alt)
+    {
+        *alt = orbit->altitude;
+    }
+    double satAz, satAlt;
+    double objAz, objAlt;
+    satellite_altaz_with_refraction(state->observer, observation, &satAz, &satAlt);
+    radec_to_altaz(state->observer, orbit, observation, state->targetRa, state->targetDec, &objAz, &objAlt);
+    double satX = cos(satAlt) * cos(satAz);
+    double satY = cos(satAlt) * sin(satAz);
+    double satZ = sin(satAlt);
+    double objX = cos(objAlt) * cos(objAz);
+    double objY = cos(objAlt) * sin(objAz);
+    double objZ = sin(objAlt);
+    double cosAngle = satX * objX + satY * objY + satZ * objZ;
     return acos(cosAngle) / DEG_TO_RAD;
 }
 
@@ -179,8 +222,8 @@ predict_julian_date_t optimize_time(satid_state *state, predict_orbit_t *orbit)
     const predict_julian_date_t gr = (sqrt(5) - 1) / 2;
     predict_julian_date_t c = b - gr * (b - a);
     predict_julian_date_t d = a + gr * (b - a);
-    double fc = search_at(state, orbit, c);
-    double fd = search_at(state, orbit, d);
+    double fc = search_at(state, orbit, c, NULL, NULL);
+    double fd = search_at(state, orbit, d, NULL, NULL);
     while ((c > d ? c - d : d - c) > 0.00000001)
     {
         double currentBail = (a + b) / 2 - bailCenter;
@@ -194,7 +237,7 @@ predict_julian_date_t optimize_time(satid_state *state, predict_orbit_t *orbit)
             d = c;
             c = b - gr * (b - a);
             fd = fc;
-            fc = search_at(state, orbit, c);
+            fc = search_at(state, orbit, c, NULL, NULL);
         }
         else
         {
@@ -202,7 +245,7 @@ predict_julian_date_t optimize_time(satid_state *state, predict_orbit_t *orbit)
             c = d;
             d = a + gr * (b - a);
             fc = fd;
-            fd = search_at(state, orbit, d);
+            fd = search_at(state, orbit, d, NULL, NULL);
         }
     }
     return (b + a) / 2;
@@ -245,7 +288,8 @@ int perform_search(satid_state *state)
     {
         return 0;
     }
-    double angle = search_at(state, orbit, time);
+    double range, altitude;
+    double angle = search_at(state, orbit, time, &range, &altitude);
     if (angle < state->maxAngle)
     {
         char timestr[50];
@@ -255,6 +299,7 @@ int perform_search(satid_state *state)
         strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", gmtime(&wholeTime));
         printf("Sat: %s (%d)\n", name, orbit->orbital_elements.satellite_number);
         printf("Angle: %f\n", angle);
+        printf("Range/Alt: %f %f\n", range, altitude);
         printf("Time: %s:%f\n", timestr, fracTime);
     }
     predict_destroy_orbit(orbit);
